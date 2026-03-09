@@ -26,7 +26,7 @@ using Windows.Storage.Streams;
 
 namespace BtExperiment
 {
-    // Writes the BATTERY_INFO measurements to CSV files. 1 CSV file per slot. Writes to same file as long as the application is running. No new file on stop/start or battery replacement. For new files press R.
+    // Writes the battery measurements to CSV files every 10s (default). 1 CSV file per slot. Writes to same file as long as the application is running. No new file on stop/start or battery replacement. For new files press R.
     // Can start programs in a primitive way, see ChargerExperimentOnStartup()
     // Logging to C:\Users\user\AppData\Local\BleCharger\MAC_Timestamp_Slot.csv
 
@@ -48,12 +48,21 @@ namespace BtExperiment
     // - ConnectionStatusChanged handler to rediscover the characteristic and re-enable notification.
     // - out of scope: scan for devices and device type filter.
 
-    // Implemented connection sequences:
-    //   If device is already connected:  ConnectRequest() -> Discover()
-    //   If device is NOT connnected:     ConnectRequest();   ... OnConnectionStatusChanged()-> Discover()
+
+    // Sequence if device is already connected:
+    //   ConnectRequest() → Discover()
+    //                          ↓ async AutonomousTask()   // will set dev.StartupTaskFinished on completion (live mode runs forever)
+    //  wait until dev.StartupTaskFinished is set or user hits ESC
+
+    // Sequence if device is NOT connnected yet:
+    //   ConnectRequest() *
+    //            ↓ async OnConnectionStatusChanged() → Discover()
+    //                                               ↓ async AutonomousTask() // will set dev.StartupTaskFinished on completion (live mode runs forever)
+    //   wait until dev.StartupTaskFinished is set or user hits ESC
+    //   * no timeout. devices may connect later (if it was previously in the system cache, otherwise no instance can be created)
 
     // General BLE properties under Windows:
-    // - Can NOT directly connect to Devices never seen during a scan.
+    // - Can NOT directly connect to Devices which are not in system cache. Needs scan in that case. Entries in system cache do expire after ca. ~12h.
     // - BLE scan can impact other connections (during scan).
     // - Characteristic objects get invalid on connection loss.
     // - Use MaintainConnection=true instead of connection retries. Keep BluetoothLEDevice object. Still, get new characteristic objects on reconnect.
@@ -65,9 +74,11 @@ namespace BtExperiment
     //     - The device is unpaired (removed from paired devices). Charger does not use pairing.
     // - Attribute handles: Windows BLE stack does not allow addressing by attribute handles. But GattCharacteristic.AttributeHandle property exists.
     //     It returns the 16-bit handle assigned by the peripheral. But it can NOT be used to bypass discovery or recreate characteristics.
-    // - Only 1 call to GetGattServicesAsync or GetCharacteristicsAsync() is possible reliably. Subsequent calls may fail for a while with "AccessDenied". There can be stale sessions from a previous run.
+    // - Quirk01: Only 1 call to GetGattServicesAsync or GetCharacteristicsAsync() is possible reliably. Subsequent calls may fail for a while with "AccessDenied". There can be stale sessions from a previous run.
     // - Debugging: if a Bluetooth mouse freezes during debugging of connect procedure, step over or use a USB mouse.
     // - No connection is required or attempted for cached discovery. But usually Windows does connect on GetGattServicesAsync()
+
+    // "Supported OS Version" 10.0.17763 (Windows 10 "1809" from October 2018). The first version with mature Bluetooth impementation.
 
     enum BatteryType : byte
     {
@@ -165,17 +176,62 @@ namespace BtExperiment
 
         public BluetoothLEDevice? device;      // does NOT get invalid on connection loss. survives reconnect
         GattSession? session;                  // does NOT get invalid on connection loss.
-        GattDeviceService? usedService;        // invalid on connection loss
-        public GattCharacteristic? chCharger;  // invalid on connection loss
-        Task? pollingTask = null;              // reconnect behavior: it will on-the-fly take the new chCharger after reconnect
+        List<GattDeviceService> usedServices = new List<GattDeviceService>();        // invalid on connection loss
 
-        public ulong Mac; // e.g. 0x0000123456789ABC for "12:34:56:78:9A:BC"
+        public GattCharacteristic? chCharger;  // invalid on connection loss
+        Task? autonomousTask = null;              // reconnect behavior: it will on-the-fly take the new chCharger after reconnect
+
+        public ulong MacBinary; // e.g. 0x0000123456789ABC for "12:34:56:78:9A:BC"
+        public string MacStr;
         CancellationTokenSource cts;
         static System.Globalization.CultureInfo culture = CultureInfo.InvariantCulture;
-        public string path = "";
+        const int TIMEOUT_CHAR_DISCOVERY_S = 20;
+        public string pathFull = "";
         public string csvStartTime = "";
         public string temperatureUnit = "?"; // filled right after connect (by reading global settings from charger)
 
+        const byte CHARGER_HEADER = 0x0F;
+
+        const byte CHARGER_WRITE_PROGRAM = 0x11; // accepted only with 40byte request (split in 2*20byte packets)
+        const byte CHARGER_START_PROGRAM = 0x05;
+        const byte CHARGER_STOP_PROGRAM = 0xFE;
+        const byte CHARGER_BATTERY_INFO = 0x55;
+        const byte CHARGER_BATTERY_CHART = 0x56;
+        const byte CHARGER_READ_VERSIONS = 0x57;
+        const byte CHARGER_READ_SYSTEM_SETTINGS = 0x61;
+        const byte CHARGER_WRITE_SYSTEM_SETTINGS = 0x63;
+        const byte CHARGER_WRITE_UNKNOWN_A = 0x65; // charger responds to it with something like "0F FE 0F F0 FF FF 00 00 00 00 00 00 00 00 00 00 00 00 00 0A" 
+        const byte CHARGER_WRITE_UNKNOWN_B = 0x66; // ''
+
+        // no responses to other command codes (0x00 .. 0xFF tested)
+        string[] CARGER_CELL_TYPES = { "LiIon", "LiFe", "LiIo4_35", "NiMH", "NiCd", "NiZn", "Eneloop", "Ram", "LTO", "NaIon" };
+        private static readonly Dictionary<byte, string> CHARGER_STATUS = new Dictionary<byte, string>
+        {   // values from https://github.com/kolinger/skyrc-mc3000, seems to be the same for BLE (0,1,2,4,132,133,134,137 verified)
+            { 0,   "Standby" },
+            { 1,   "Charge" },
+            { 2,   "Discharge" },
+            { 3,   "Pause" },
+            { 4,   "Completed" },
+            { 128, "Input low voltage" },
+            { 129, "Input high voltage" },
+            { 130, "ADC MCP3424-1 error" },
+            { 131, "ADC MCP3424-2 error" },
+            { 132, "Connection break" },
+            { 133, "Check voltage" },
+            { 134, "Capacity limit reached" },
+            { 135, "Time limit reached" },
+            { 136, "SysTemp too hot" },
+            { 137, "Battery too hot" },
+            { 138, "Short circuit" },
+            { 139, "Wrong polarity" },
+            { 140, "Bad battery (high IR)" }
+        };
+        public string GetStatusDescription(byte statusCode)
+        {
+            return CHARGER_STATUS.TryGetValue(statusCode, out var description) ? description : $"Stat_{statusCode}";
+        }
+
+        #region region_charging_programs
         // BleApp sets some unused values. Reasons unknown.
         // Charger accepts these profiles here, with zeroes in all unused values, and works as expected.
         // cut_temperature  for units see temperatureUnit
@@ -288,32 +344,59 @@ namespace BtExperiment
             cut_temperature = 45,
             // "ignored" = setting is not changeable on the charger.
         };
+        #endregion
 
-
-        public static string getTs()
+        public static string GetTs()
         {
             //string ts = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"); // the most simple ISO 8601 format
             string ts = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"); // compatible with LibreOffice Calc (just selecting "YMD" will parse the whole timestamp including time)
             return ts;
         }
+        public static string GetCompactTs()
+        {
+            string ts = DateTime.Now.ToString("yyyyMMddTHHmmss"); //  compact ISO 8601 format without separators, with T between date and time 
+            return ts;
+        }
+
         ushort SwapEndian16(ushort value)
         {
             return (ushort)((value >> 8) | (value << 8));
         }
+
         public static byte ToCelsius(byte fahrenheit) // input range 32°F - 255°F
         {
             return (byte)Math.Round((fahrenheit - 32) * 5.0 / 9.0);
         }
+
         public static byte ToFahrenheit(byte celsius) // input range 0°C - 123°C
         {
             return (byte)Math.Round(celsius * 9.0 / 5.0 + 32.0);
         }
-        void InitChargerCsv()
+
+        // param full path including file name or "measurement name"
+        void InitCsv(string logPath)
         {
-            string folder = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            //string folder = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-            path = Path.Combine(folder, "BleCharger");
-            Console.WriteLine("CSV path: " + path);
+            string path = logPath;
+            if (logPath == null || logPath == "")
+                path = GetCompactTs();
+
+            if (Path.IsPathFullyQualified(Path.GetDirectoryName(path)))
+            {
+                string? folder = Path.GetDirectoryName(path);
+                if (!Directory.Exists(folder))
+                    Directory.CreateDirectory(folder);
+                string filename = Path.GetFileName(path).Split(".")[0]; // remove file ending
+                path = Path.Combine(folder, $"{filename}_{MacStr}.csv"); // insert MAC into file name
+            }
+            else
+            {
+                string folderBase = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                string folder = Path.Combine(folderBase, "BleCharger");
+                if (!Directory.Exists(folder))
+                    Directory.CreateDirectory(folder);
+                string filename = $"{logPath}_{MacStr}.csv";
+                pathFull = Path.Combine(folder, filename);
+            }
 
             csvStartTime = DateTime.Now.ToString("yyyyMMddTHHmmss"); //  compact ISO 8601 format without separators, with T between date and time 
         }
@@ -324,13 +407,16 @@ namespace BtExperiment
             // remark: this is not syncrhonized to all slots (so some slots may already be sampled in the old CSV files).
         }
 
-        void WriteChargerCsv(ulong mac, byte channel, short voltage, short current, short capacity, short temperature, string status)
+        // Timestamp in CSV is local time, without timezone and DST. Because ISO 8601 formats can not be imported in LibreOffice (UTC or local+DST).
+        // On DST enabling in outumn the timestamp is ambiguous for 1h in the file.
+        // On timezone switching (between reads) the timestamps get wrong/ambiguous
+        void WriteCsv(ulong mac, byte channel, short voltage, short current, short capacity, short temperature, string status)
         {
-            if (path == null || path == "")
+            if (pathFull == null || pathFull == "")
                 return;
 
             string macStr = mac.ToString("X12");
-            string pathComplete = Path.Combine(path, $"{macStr}_{csvStartTime}_{channel}.csv");
+            string pathComplete = Path.Combine(pathFull, $"{macStr}_{csvStartTime}_{channel}.csv");
             const string separator = ";";
 
             StringWriter writer = new StringWriter();
@@ -339,9 +425,9 @@ namespace BtExperiment
 
             if (!File.Exists(pathComplete))
             {
-                if (Path.IsPathFullyQualified(path))
+                if (Path.IsPathFullyQualified(pathFull))
                 {
-                    Directory.CreateDirectory(path);
+                    Directory.CreateDirectory(pathFull);
                 }
 
                 // create titles
@@ -350,7 +436,7 @@ namespace BtExperiment
             }
 
             //string line = GenerateIso8601_LocalTime()+ separator; // import in LibreOffice fails
-            string line = getTs() + separator; 
+            string line = GetTs() + separator; 
             // write CSV line
             line += voltage.ToString() + separator;
             line += current.ToString() + separator;
@@ -361,53 +447,15 @@ namespace BtExperiment
             File.AppendAllText(pathComplete, line);
         }
 
-        public BleCharger(ulong Mac)
+        public BleCharger(ulong Mac, int interval_ms = 10000, string logPath = "") // TODO: logpath
         {
-            this.Mac = Mac;
+            this.MacBinary = Mac;
+            MacStr = $"{Mac:X12}";
             cts = new CancellationTokenSource();
-            InitChargerCsv();
+            InitCsv(logPath);
         }
 
-        const byte CHARGER_HEADER = 0x0F;
-
-        const byte CHARGER_WRITE_PROGRAM = 0x11; // accepted only with 40byte request (split in 2*20byte packets)
-        const byte CHARGER_START_PROGRAM = 0x05;
-        const byte CHARGER_STOP_PROGRAM = 0xFE;
-        const byte CHARGER_BATTERY_INFO = 0x55;
-        const byte CHARGER_BATTERY_CHART = 0x56;
-        const byte CHARGER_READ_VERSIONS = 0x57;
-        const byte CHARGER_READ_SYSTEM_SETTINGS = 0x61;
-        const byte CHARGER_WRITE_SYSTEM_SETTINGS = 0x63;
-        const byte CHARGER_WRITE_UNKNOWN_A = 0x65;
-        const byte CHARGER_WRITE_UNKNOWN_B = 0x66;
-
-        // no responses to other command codes (0x00 .. 0xFF tested)
-        string[] CARGER_CELL_TYPES = { "LiIon", "LiFe", "LiIo4_35", "NiMH", "NiCd", "NiZn", "Eneloop", "Ram", "LTO", "NaIon"};
-        private static readonly Dictionary<byte, string> CHARGER_STATUS = new Dictionary<byte, string>
-        {   // values from https://github.com/kolinger/skyrc-mc3000, seems to be the same for BLE (0,1,2,4,132,133,134,137 verified)
-            { 0,   "Standby" },
-            { 1,   "Charge" },
-            { 2,   "Discharge" },
-            { 3,   "Pause" },
-            { 4,   "Completed" },
-            { 128, "Input low voltage" },
-            { 129, "Input high voltage" },
-            { 130, "ADC MCP3424-1 error" },
-            { 131, "ADC MCP3424-2 error" },
-            { 132, "Connection break" },
-            { 133, "Check voltage" },
-            { 134, "Capacity limit reached" },
-            { 135, "Time limit reached" },
-            { 136, "SysTemp too hot" },
-            { 137, "Battery too hot" },
-            { 138, "Short circuit" },
-            { 139, "Wrong polarity" },
-            { 140, "Bad battery (high IR)" }
-        };
-        public string GetStatusDescription(byte statusCode)
-        {
-            return CHARGER_STATUS.TryGetValue(statusCode, out var description) ? description : $"Stat_{statusCode}";
-        }
+        #region region_ble_commands
         byte CalculateChecksum(byte[] data, int len)
         {
             byte sum = 0;
@@ -616,7 +664,7 @@ namespace BtExperiment
             req[29] = p.discharge_resting_time;
             req[39] = CalculateChecksum(req, 39);
 
-            Console.WriteLine($"{Mac:X12} PRG: {BitConverter.ToString(req)}");
+            Console.WriteLine($"{MacStr} PRG: {BitConverter.ToString(req)}");
 
             // Split in 20 byte chunks. Sending 40byte fails with: "Value does not fall within the expected range."
             byte[] part1 = req.AsSpan(0, 20).ToArray();
@@ -627,8 +675,9 @@ namespace BtExperiment
             // expected response, e.g.: 0F 11 0F F0 FF FF 00 00 00 00 00 00 00 00 00 00 00 00 00 1D    with byte2 = slots (0x0F here = all slots selected)
             // on successfull program completion the charger sends: 0F-B0-00-01-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-C0  (with byte2 = slot number)
         }
+        #endregion
 
-        public async Task ChargerStartProgram(byte slots, ChargerProgram p)
+        public async Task ChargerSetupProgram(byte slots, ChargerProgram p)
         {
             if (temperatureUnit == "C")
                 p.cut_temperature = 45;
@@ -645,12 +694,12 @@ namespace BtExperiment
         }
 
 
-        public async Task ChargerExperimentOnStartup()
+        public async Task StartupTask()
         {
 
-            Console.WriteLine($"{Mac:X12} DevStatus: {device?.ConnectionStatus} ConnStatus: {session?.SessionStatus}.");
+            Console.WriteLine($"{MacStr} DevStatus: {device?.ConnectionStatus} ConnStatus: {session?.SessionStatus}.");
 
-            await ChargerGetVersions(Mac);
+            await ChargerGetVersions(MacBinary);
             await Task.Delay(250);
             await ChargerGetSettings(); // Do not deactivate this call. It gets the temperature units from charger.
             await Task.Delay(250);
@@ -658,7 +707,37 @@ namespace BtExperiment
             //await ChargerWriteSettings();
             //await Task.Delay(250);
 
-            //await ChargerStartProgram(0x01, PrgLiIon_charge);
+            //await ChargerSetupProgram(0x01, PrgLiIon_charge);
+        }
+        public async Task AutonomousTask() // polling for live values
+        {
+            await StartupTask();
+
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    for (byte channelIndex = 0; channelIndex <= 3; channelIndex++)
+                    {
+                        await ChargerBatteryInfo(channelIndex);
+                        await Task.Delay(250, cts.Token); // if shorter (e.g. 100ms), duplicate responses may occur (more responses than requests).
+                        if (cts.IsCancellationRequested)
+                            return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.ToString());
+                }
+                try
+                {
+                    await Task.Delay(9600, cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    Console.WriteLine($"{GetTs()} {MacStr} Task ended by user.");
+                }
+            }
         }
 
         public void OnNotificationReceived(GattCharacteristic sender, GattValueChangedEventArgs args)
@@ -690,8 +769,8 @@ namespace BtExperiment
 
                     if (status != 0 || time != 0 || voltage != 0 )
                     {
-                        Console.WriteLine($"{ts} {Mac:X12} {slot} {cellType} {mode} {count} {statusStr} - {time} s, {voltage} mV, {current} mA, {capacity} mAh, {temperature} °{temperatureUnit}");
-                        WriteChargerCsv(Mac, slot, voltage, current, capacity, temperature, statusStr);
+                        Console.WriteLine($"{ts} {MacStr} {slot} {cellType} {mode} {count} {statusStr} - {time} s, {voltage} mV, {current} mA, {capacity} mAh, {temperature} °{temperatureUnit}");
+                        WriteCsv(MacBinary, slot, voltage, current, capacity, temperature, statusStr);
                     }
                 }
                 else if (data[0] == CHARGER_HEADER && data[1] == CHARGER_READ_SYSTEM_SETTINGS)
@@ -704,44 +783,59 @@ namespace BtExperiment
                     {
                         temperatureUnit = "F";
                     }
-                    Console.WriteLine($"{ts} {Mac:X12} NOTIFY: {BitConverter.ToString(data)}"); // all other notifications
+                    Console.WriteLine($"{ts} {MacStr} NOTIFY: {BitConverter.ToString(data)}");
                 }
                 else
                 {
-                    Console.WriteLine($"{ts} {Mac:X12} NOTIFY: {BitConverter.ToString(data)}"); // all other notifications
+                    Console.WriteLine($"{ts} {MacStr} NOTIFY: {BitConverter.ToString(data)}"); // all other notifications
                 }
             }
             else
             {
-                Console.WriteLine($"{ts} {Mac:X12} NOTIFY {sender.Uuid}: {BitConverter.ToString(data)}"); // robustness
+                Console.WriteLine($"{ts} {MacStr} NOTIFY {sender.Uuid}: {BitConverter.ToString(data)}"); // robustness
             }
         }
 
-        public async Task ChargerPolling()
+        public void CacheCharacteristics(GattDeviceService srv, GattCharacteristic ch)
         {
-            await ChargerExperimentOnStartup();
+            if (ch.Uuid == chargerChUuid)
+                chCharger = ch;
+        }
+        public void UncacheCharacteristics()
+        {
+            chCharger = null;
+        }
 
-            while (!cts.IsCancellationRequested)
+        public async Task EnableNotifications()
+        {
+            await EnableNotification(chCharger);
+        }
+
+        public async Task DisableNotifications()
+        {
+            await DisableNotification(chCharger);
+        }
+
+        public async Task EnableNotification(GattCharacteristic? characteristic)
+        {
+            if (characteristic == null)
+                return;
+            characteristic.ValueChanged -= OnNotificationReceived; // to prevent double-subscription, which would lead to multiple calls of the OnNotificationReceived()
+            characteristic.ValueChanged += OnNotificationReceived;
+            GattCommunicationStatus status;
+            status = await characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify);
+
+            if (status == GattCommunicationStatus.Success)
             {
-                try
-                {
-                    for (byte channelIndex = 0; channelIndex <= 3; channelIndex++)
-                    {
-                        await ChargerBatteryInfo(channelIndex);
-                        await Task.Delay(250, cts.Token); // if shorter (e.g. 100ms), duplicate responses may occur (more responses than requests).
-                        if (cts.IsCancellationRequested)
-                            return;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine(ex.ToString());
-                }
-
-                await Task.Delay(9600, cts.Token);
+                //Console.WriteLine($"{SerialNumber} Notifications enabled on characteristic {characteristic.Uuid}");
+            }
+            else
+            {
+                Console.WriteLine($"{GetTs()} {MacStr} Failed to enable notifications: {status}");
             }
         }
-        public async Task DisableNotificationAsync(GattCharacteristic? characteristic)
+
+        public async Task DisableNotification(GattCharacteristic? characteristic)
         {
             if (characteristic == null)
                 return;
@@ -750,55 +844,79 @@ namespace BtExperiment
                 var status = await characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.None); // even if disconnected already, call this. It is fast.
                 if (status == GattCommunicationStatus.Success)
                 {
-                    Console.WriteLine($"{Mac:X12} Notifications disabled on characteristic {characteristic.Uuid}");
+                    //Console.WriteLine($"{getTs()} {MacStr} Notifications disabled on characteristic {characteristic.Uuid}");
                     characteristic.ValueChanged -= OnNotificationReceived;
                 }
                 else
                 {
-                    Console.WriteLine($"{Mac:X12} Failed to disable notifications: {status}");
+                    Console.WriteLine($"{GetTs()} {MacStr} Failed to disable notifications: {status}");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"{Mac:X12} Exception while disabling notifications: {ex.Message}.");
+                Console.WriteLine($"{GetTs()} {MacStr} Exception while disabling notifications: {ex.Message}.");
             }
         }
 
+        public void ShowConnectionParameters()
+        {
+            // try to read connection parameters 
+            try
+            {
+                BluetoothLEConnectionParameters? par = device?.GetConnectionParameters(); // is not available on Win10. Available on Win11.
+                Console.WriteLine($"{GetTs()} {MacStr} Interval {par?.ConnectionInterval * 1.25:F0} ms, Timeout {par?.LinkTimeout / 100.0:F1} s, Latency {par?.ConnectionLatency}");
+            }
+            catch (Exception)
+            {
+                Console.WriteLine($"{GetTs()} {MacStr} GetConnectionParameters() is not available on this platform.");
+            }
+        }
+        public ushort GetConnectionInverval() // return connection interval in ms, or 0 if not available
+        {
+            try
+            {
+                BluetoothLEConnectionParameters? par = device?.GetConnectionParameters();
+                if (par != null)
+                    return (ushort)(par.ConnectionInterval * 1.25); // [ms]
+            }
+            catch (Exception) { } // may nob be unsupported
+            return 0;
+        }
+		
         public async void OnConnectionStatusChanged(BluetoothLEDevice sender, object args)
         {
             // on Windows 10 & 11 the reconnection handling can be simplified by setting MaintainConnection == true (setting once, after creating the BluetoothLEDevice instance)
-            string ts = getTs();
+            string ts = GetTs();
             if (sender.ConnectionStatus == BluetoothConnectionStatus.Disconnected)
             {
-                Console.WriteLine($"{ts} {Mac:X12} disconnected.");
+                Console.WriteLine($"{ts} {MacStr} disconnected.");
             }
             else if (sender.ConnectionStatus == BluetoothConnectionStatus.Connected)
             {
-                Console.WriteLine($"{ts} {Mac:X12} connected. Discovering ...");
+                Console.WriteLine($"{ts} {MacStr} connected. Discovering ...");
                 try
                 {
                     bool success = await Discover();
-                    if (success == true && pollingTask == null)
+                    if (success == true && autonomousTask == null)
                     {
-                        pollingTask = ChargerPolling();
+                        autonomousTask = AutonomousTask();
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"{ts} {Mac:X12} Exception during reconnect handling: {ex.Message}");
+                    Console.WriteLine($"{ts} {MacStr} Exception during reconnect handling: {ex.Message}");
                 }
             }
         }
 
-        // TODO: make a separate Create() function for the case with already connected device?
-        public async Task ConnectRequest() // Can be called if device is disconnected OR connected.
+        public async Task<bool> ConnectRequest() // Can be called if device is disconnected OR connected.
         {
-            Console.WriteLine($"{getTs()} {Mac:X12} creating BLE device and session ...");
-            device = await BluetoothLEDevice.FromBluetoothAddressAsync(Mac);
+            Console.WriteLine($"{GetTs()} {MacStr} creating BLE device and session ...");
+            device = await BluetoothLEDevice.FromBluetoothAddressAsync(MacBinary);
             if (device == null)
             {
-                Console.WriteLine($"{getTs()} {Mac:X12} Failed to create instance.");
-                return;
+                Console.WriteLine($"{GetTs()} {MacStr} Failed to create instance.");
+                return false;
             }
             session = await GattSession.FromDeviceIdAsync(device.BluetoothDeviceId);
             device.ConnectionStatusChanged += OnConnectionStatusChanged;
@@ -806,13 +924,18 @@ namespace BtExperiment
 
             if (device.ConnectionStatus == BluetoothConnectionStatus.Connected) // if already connected, there will be no Connected event, so call Discover() here
             { // ? (session.SessionStatus == GattSessionStatus.Active)
-                Console.WriteLine($"{getTs()} {Mac:X12} already connected. Discovering ...");
+                Console.WriteLine($"{GetTs()} {MacStr} already connected. Discovering ...");
                 bool success = await Discover();
                 if (success)
                 {
-                    pollingTask = ChargerPolling();
+                    autonomousTask = AutonomousTask();
                 }
             }
+            else
+            {
+                Console.WriteLine($"{GetTs()} {MacStr} trying to connect ...");
+            }
+            return true;
         }
 
         public async Task<bool> Discover()
@@ -822,111 +945,85 @@ namespace BtExperiment
             // TODO: add Cleanup of BLe objects to error paths 
             if (device == null || device.ConnectionStatus != BluetoothConnectionStatus.Connected)
             {
-                Console.WriteLine($"{getTs()} {Mac:X12} BluetoothConnectionStatus is {device?.ConnectionStatus}. Abort.");
+                Console.WriteLine($"{GetTs()} {MacStr} BluetoothConnectionStatus is {device?.ConnectionStatus}. Abort.");
                 return false;
             }
 
-            // Just get reference to one characteristic and store it to chCharger
+            // Just get reference to some characteristics and store it to chTemperature and so on
             try
             {
                 GattDeviceServicesResult srvResult;
                 srvResult = await device?.GetGattServicesAsync(BluetoothCacheMode.Uncached);
                 int ctr1 = 0;
-                while ((srvResult.Status != GattCommunicationStatus.Success || srvResult.Services.Count == 0) && ctr1 < 10) // usually AccessDenied error
+                while ((srvResult.Status != GattCommunicationStatus.Success || srvResult.Services.Count == 0) && ctr1 < TIMEOUT_CHAR_DISCOVERY_S) // usually AccessDenied error
                 {
-                    Console.WriteLine($"{getTs()} {Mac:X12} Waiting for GATT Services.");
+                    Console.WriteLine($"{GetTs()} {MacStr} Waiting for GATT Services.");
                     ctr1++;
                     await Task.Delay(1000);
+                    if (cts.IsCancellationRequested)
+                        return false;
                     srvResult = await device?.GetGattServicesAsync(BluetoothCacheMode.Uncached);
                 }
                 if (srvResult.Status != GattCommunicationStatus.Success)
                 {
-                    Console.WriteLine($"{getTs()} {Mac:X12} Service discovery failed: {srvResult.Status}");
+                    Console.WriteLine($"{GetTs()} {MacStr} Service discovery failed: {srvResult.Status}");
                     return false;
                 }
                 if (device == null || device.ConnectionStatus != BluetoothConnectionStatus.Connected)
                 {
-                    Console.WriteLine($"{getTs()} {Mac:X12} Device already lost.");
+                    Console.WriteLine($"{GetTs()} {MacStr} Device already lost.");
                     return false;
                 }
                 foreach (GattDeviceService srv in srvResult.Services)
                 {
-                    if (srv.Uuid == chargerServiceUuid)
+                    if (!(srv.Uuid == chargerServiceUuid)) // for Quirk01. Increases success rate.
+                        continue; // skip characteristic discovery (for serivces not explicitly listed above).
+                    Console.WriteLine($"{GetTs()} {MacStr} srv: {srv.Uuid}");
+                    var chResult = await srv.GetCharacteristicsAsync(BluetoothCacheMode.Uncached); // recommeded to not mix Cached/Uncached
+                    int ctr2 = 0;
+                    while ((chResult.Status != GattCommunicationStatus.Success || chResult.Characteristics.Count == 0) && ctr2 < TIMEOUT_CHAR_DISCOVERY_S) // usually AccessDenied error
                     {
-                        var chResult = await srv.GetCharacteristicsAsync(BluetoothCacheMode.Uncached); // recommeded to not mix Cached/Uncached
-                        int ctr2 = 0;
-                        while ((chResult.Status != GattCommunicationStatus.Success || chResult.Characteristics.Count == 0) && ctr2 < 12) // usually AccessDenied error
-                        {
-                            Console.WriteLine($"{getTs()} {Mac:X12} Waiting for GATT Characteristics.");
-                            ctr2++;
-                            await Task.Delay(1000);
-                            chResult = await srv.GetCharacteristicsAsync(BluetoothCacheMode.Uncached);
-                        }
-                        if (chResult.Status != GattCommunicationStatus.Success || chResult.Characteristics.Count == 0)
-                        {
-                            Console.WriteLine($"{getTs()} {Mac:X12} Characteristic discovery failed.");
+                        Console.WriteLine($"{GetTs()} {MacStr} Waiting for GATT Characteristics.");
+                        ctr2++;
+                        await Task.Delay(1000);
+                        if (cts.IsCancellationRequested)
                             return false;
-                        }
-                        else
-                        {
-                            chCharger = chResult.Characteristics.FirstOrDefault(c => c.Uuid == chargerChUuid);
-                            if (chCharger == null)
-                            {
-                                Console.WriteLine($"{getTs()} {Mac:X12} Charger characteristic not found.");
-                                return false;
-                            }
-                        }
-                        usedService = srv;
+                        chResult = await srv.GetCharacteristicsAsync(BluetoothCacheMode.Uncached);
+                    }
+                    if (chResult.Status != GattCommunicationStatus.Success || chResult.Characteristics.Count == 0)
+                    {
+                        Console.WriteLine($"{GetTs()} {MacStr} Characteristic discovery failed.");
+                        return false;
                     }
                     else
                     {
-                        srv.Dispose();
+                        foreach (GattCharacteristic ch in chResult.Characteristics)
+                        {
+                            CacheCharacteristics(srv, ch);
+                        }
+
+
                     }
+                    usedServices.Add(srv);
                 }
+
+                ShowConnectionParameters();
+
+                // Enable notifications
+                Console.WriteLine($"{GetTs()} {MacStr} Enable notifications...");
+                await EnableNotifications();
+                return true;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"{getTs()} {Mac:X12} First uncached access failed. For now the Discovery is abborted without any handling. Exception message: {ex.Message}");
+                Console.WriteLine($"{GetTs()} {MacStr} First uncached access failed. For now the Discovery is abborted without any handling. Exception message: {ex.Message}");
                 return false;
             }
-
-            // try to read connection parameters 
-            try
-            {
-                BluetoothLEConnectionParameters? par = device?.GetConnectionParameters(); // is not available on Win10. Availabl on Win11.
-                Console.WriteLine($"{Mac:X6} Interval {par?.ConnectionInterval * 1.25:F0} ms, Timeout {par?.LinkTimeout / 100.0:F1} s, Latency {par?.ConnectionLatency}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"{Mac:X6} GetConnectionParameters() is not available on this platform.");
-            }
-
-
-            // Enable notification on chCharger
-            if (chCharger != null)
-            {
-                chCharger.ValueChanged -= OnNotificationReceived; // to prevent double-subscription, which would lead to multiple calls of the OnNotificationReceived()
-                chCharger.ValueChanged += OnNotificationReceived;
-                var cccdStatus = await chCharger.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify);
-                if (cccdStatus == GattCommunicationStatus.Success)
-                {
-                    Console.WriteLine($"{getTs()} {Mac:X12} Notifications enabled");
-                    return true;
-                }
-                else
-                {
-                    Console.WriteLine($"{getTs()} {Mac:X12} Failed to enable notifications");
-                    chCharger.ValueChanged -= OnNotificationReceived;
-                    chCharger = null;
-                }
-            }
-
-            return false;
         }
 
         public async Task Disconnect()
         {
-            Console.WriteLine($"{getTs()} {Mac:X12} Disconnecting ...");
+            Console.WriteLine($"{GetTs()} {MacStr} Disconnecting ...");
 
             cts?.Cancel();
             await Task.Delay(100);
@@ -941,10 +1038,13 @@ namespace BtExperiment
             if (device != null)
             {
 
-                await DisableNotificationAsync(chCharger); // will also work, if connection was already lost
-                chCharger = null;  // reference to characteristic object
-                usedService?.Dispose(); // helpful, at least for debugging, BLE connection is closed faster.
-                usedService = null;
+                await DisableNotifications(); // will also work, if connection was already lost
+                UncacheCharacteristics(); // reference to characteristic objects
+                foreach (var srv in usedServices)  // helpful, at least for debugging, BLE connection is closed faster.
+                {
+                    srv.Dispose();
+                }
+                usedServices.Clear();
 
                 device.ConnectionStatusChanged -= OnConnectionStatusChanged;
                 device.Dispose();
